@@ -1,8 +1,10 @@
 fastapi
 uvicorn
 aiosqlite
+slowapi
 yt-dlp
 python-dotenv
+httpx
 beautifulsoup4
 playwright
 zipstream-new

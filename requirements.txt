@@ -3,5 +3,6 @@ uvicorn
 aiosqlite
 yt-dlp
 python-dotenv
-playwright
 beautifulsoup4
+playwright
+zipstream-new

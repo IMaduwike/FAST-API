@@ -1,10 +1,22 @@
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 import aiosqlite
 from dotenv import load_dotenv
 from routers.tiktok import router as tiktok_router
 from routers.tiktok import file_router
 from routers.anime import router as anime_router
 app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",  # Vite dev server
+        "http://localhost:3000",  # Just in case
+        "https://your-production-domain.com"  # Add your production domain later
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods (GET, POST, etc.)
+    allow_headers=["*"],  # Allows all headers
+)
 app.include_router(tiktok_router)
 app.include_router(anime_router)
 app.include_router(file_router)
@@ -44,6 +56,7 @@ async def startup():
             episode TEXT,
             video_url TEXT,
             size TEXT,
+            snapshot TEXT,
             UNIQUE(internal_id, episode)
         )
     """)

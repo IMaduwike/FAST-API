@@ -1,6 +1,8 @@
+import zipfile
+import io
 import asyncio
-from fastapi import APIRouter, Query, Depends
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, Query, Depends,Request
+from fastapi.responses import JSONResponse,StreamingResponse
 import httpx
 from db import get_db
 from helpers.anime_helper import get_pahewin_link,get_episode_session,get_kiwi_url,get_redirect_link
@@ -49,6 +51,7 @@ async def anime_search(query: str = Query(..., description="Anime name for the s
                 "episodes": episodes,
                 "status": i.get("status"),
                 "year": i.get("year"),
+                "poster": i.get("poster"),
                 "rating": i.get("score")
             }
             search_result.append(filtered_search_result)
@@ -115,6 +118,7 @@ async def anime_download(id:str = Query(...,description="id for the anime from s
     search_result = await get_episode_session(info["external_id"],db)
     episode_info = search_result[int(episode)-1]
     episode_session = episode_info.get("session")
+    episode_snapshot = episode_info.get("snapshot")
     pahe_link = await get_pahewin_link(info["external_id"], episode_session)
     if pahe_link is None:
         return JSONResponse(status_code=404,content={
@@ -122,7 +126,7 @@ async def anime_download(id:str = Query(...,description="id for the anime from s
             "message": "Internal Link not found"
         })
     kiwi_url = await get_kiwi_url(pahe_link)
-    results = await get_redirect_link(kiwi_url, id, episode,db)
+    results = await get_redirect_link(kiwi_url, id, episode,db,episode_snapshot)
     if not results:
         return JSONResponse(status_code=500,content={
         "status": 500,
@@ -225,7 +229,7 @@ async def _fetch_single_episode(id: str, episode: int, external_id: str, db):
         search_result = await get_episode_session(external_id, db)
         episode_info = search_result[episode - 1]
         episode_session = episode_info.get("session")
-        
+        episode_snapshot = episode_info.get("snapshot")
         pahe_link = await get_pahewin_link(external_id, episode_session)
         if not pahe_link:
             print(f"❌ Episode {episode}: No pahe link found")
@@ -236,7 +240,7 @@ async def _fetch_single_episode(id: str, episode: int, external_id: str, db):
             print(f"❌ Episode {episode}: No kiwi URL found")
             return None
         
-        results = await get_redirect_link(kiwi_url, id, episode, db)
+        results = await get_redirect_link(kiwi_url, id, episode, db,episode_snapshot)
         
         if results and results.get("status") == 200:
             print(f"✅ Episode {episode}: Successfully fetched")
@@ -248,3 +252,70 @@ async def _fetch_single_episode(id: str, episode: int, external_id: str, db):
     except Exception as e:
         print(f"❌ Episode {episode}: Error - {e}")
         return None
+
+
+
+
+@router.post("/bulk-download-zip")
+async def bulk_download_zip(request: Request):
+    """
+    Streams ZIP file without loading everything in memory
+    Request body: {
+        "links": [
+            {"episode": 1, "direct_link": "..."},
+            ...
+        ],
+        "anime_title": "One Piece"
+    }
+    """
+    body = await request.json()
+    links = body.get("links", [])
+    anime_title = body.get("anime_title", "Anime").replace(" ", "_")
+    
+    async def zip_generator():
+        """Generate ZIP file on-the-fly"""
+        
+        # Create a generator-based ZIP
+        import zipstream
+        
+        z = zipstream.ZipFile(mode='w', compression=zipstream.ZIP_DEFLATED)
+        
+        async with httpx.AsyncClient(timeout=300) as client:
+            for link_info in links:
+                episode = link_info.get("episode")
+                url = link_info.get("direct_link")
+                
+                if not url:
+                    continue
+                
+                filename = f"{anime_title}_Episode_{episode}.mp4"
+                
+                print(f"📥 Streaming episode {episode}...")
+                
+                try:
+                    response = await client.get(url, timeout=300)
+                    
+                    if response.status_code == 200:
+                        # Add file to ZIP from bytes
+                        z.write_iter(filename, iter([response.content]))
+                        print(f"✅ Added episode {episode}")
+                    else:
+                        print(f"❌ Failed episode {episode}: status {response.status_code}")
+                        
+                except Exception as e:
+                    print(f"❌ Error episode {episode}: {e}")
+                    continue
+        
+        # Stream the ZIP
+        for chunk in z:
+            yield chunk
+    
+    filename = f"{anime_title}_Episodes.zip"
+    
+    return StreamingResponse(
+        zip_generator(),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f"attachment; filename={filename}"
+        }
+    )

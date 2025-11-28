@@ -5,9 +5,7 @@ import os
 import re
 from bs4 import BeautifulSoup
 import httpx
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.common.exceptions import TimeoutException
+from playwright.async_api import async_playwright,TimeoutError
 from utils.helper import deobfuscate,extract_info
 
 def cookies_expired(cookie_dict):
@@ -21,38 +19,56 @@ def cookies_expired(cookie_dict):
 
 CACHE_FILE = "animepahe_cookies.json"
 
+
+
+
+CACHE_FILE = "animepahe_cookies.json"
+
 async def get_animepahe_cookies():
     # 1️⃣ Check if cached cookies exist and are still valid
     if os.path.exists(CACHE_FILE):
         with open(CACHE_FILE, "r") as f:
             data = json.load(f)
-        if not cookies_expired(data):
+        if not cookies_expired(data):  # Your existing expiry check
             print("Used cookies from Cached")
             return {k: v["value"] for k, v in data.items()}
 
     # 2️⃣ Else: try to regenerate cookies
     try:
-        # Run Selenium in executor to make it async
-        loop = asyncio.get_event_loop()
-        cookies = await loop.run_in_executor(None, _fetch_cookies_sync)
-        
-        if cookies is None:
-            raise Exception("Failed to fetch cookies")
-        
-        # Prepare cookie dict
-        cookie_dict = {
-            c['name']: {
-                "value": c['value'],
-                "expires": c.get("expiry")
-            }
-            for c in cookies
-        }
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context()
+            page = await context.new_page()
 
-        # Save to cache
-        with open(CACHE_FILE, "w") as f:
-            json.dump(cookie_dict, f)
-        print("Used cookies from animepahe server")
-        return {k: v["value"] for k, v in cookie_dict.items()}
+            # Go to Animepahe
+            await page.goto("https://animepahe.si")
+
+            # Wait for main content to load, not full network idle
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=10000)
+            except TimeoutError:
+                print("⚠️ Timeout waiting for DOMContentLoaded, continuing anyway...")
+
+            # Optional small sleep to ensure cookies are set
+            await asyncio.sleep(1)
+
+            cookies = await context.cookies()
+            await browser.close()
+
+            # Prepare cookie dict
+            cookie_dict = {
+                c['name']: {
+                    "value": c['value'],
+                    "expires": c.get("expires")
+                }
+                for c in cookies
+            }
+
+            # Save to cache
+            with open(CACHE_FILE, "w") as f:
+                json.dump(cookie_dict, f)
+            print("Used cookies from animepahe server")
+            return {k: v["value"] for k, v in cookie_dict.items()}
 
     except Exception as e:
         print("⚠️ Failed to get new cookies:", e)
@@ -62,42 +78,7 @@ async def get_animepahe_cookies():
                 data = json.load(f)
                 print("Cookies gotten through the try except method")
             return {k: v["value"] for k, v in data.items()}
-        return None
-
-
-def _fetch_cookies_sync():
-    """Synchronous function to fetch cookies using Selenium"""
-    driver = None
-    try:
-        options = Options()
-        options.add_argument('--headless')
-        options.add_argument('--no-sandbox')
-        options.add_argument('--disable-dev-shm-usage')
-        options.add_argument('--disable-gpu')
-        
-        driver = webdriver.Chrome(options=options)
-        driver.set_page_load_timeout(5)
-        
-        # Go to Animepahe
-        try:
-            driver.get("https://animepahe.si")
-        except TimeoutException:
-            print("⚠️ Timeout waiting for page load, continuing anyway...")
-        
-        # Small wait for Cloudflare
-        time.sleep(2)
-        
-        # Get cookies
-        cookies = driver.get_cookies()
-        return cookies
-        
-    except Exception as e:
-        print(f"Error in Selenium: {e}")
-        return None
-    finally:
-        if driver:
-            driver.quit()
-
+        return None  # No cookies available
 
 async def get_actual_episode(external_id):
     if not external_id:
@@ -110,7 +91,10 @@ async def get_actual_episode(external_id):
             cookies=cookies,
             timeout=10
         )
+    if res.status_code != 200:
+        return None
     data = res.json()
+
     return data.get("total")
 
 async def get_cached_anime_info(id, db):
@@ -154,6 +138,7 @@ async def get_cached_anime_info(id, db):
     
     except Exception as e:
         print(f"Error in get_cached_anime_info: {e}")
+        traceback.print_exc()
         return {"status": 500, "message": f"Internal error: {str(e)}"}
 
 async def get_episode_session(id,db):
@@ -314,7 +299,7 @@ def _parse_and_deobfuscate_kiwi(html, cookies):
         "kwik_session": cookies.get("kwik_session")
     }
 
-async def get_redirect_link(url, id, episode, db):
+async def get_redirect_link(url, id, episode, db,snapshot):
     if not url or not id or not episode:
         print("No url,episode or id detected ending now")
         return None
@@ -356,8 +341,8 @@ async def get_redirect_link(url, id, episode, db):
     
     # Async database operations
     await db.execute(
-        "INSERT OR REPLACE INTO cached_video_url(internal_id,episode,video_url,size) VALUES(?,?,?,?)",
-        (id, episode, direct_link, size)
+        "INSERT OR REPLACE INTO cached_video_url(internal_id,episode,video_url,size,snapshot) VALUES(?,?,?,?,?)",
+        (id, episode, direct_link, size,snapshot)
     )
     await db.commit()
     
@@ -365,6 +350,7 @@ async def get_redirect_link(url, id, episode, db):
     return {
         "direct_link": direct_link,
         "episode": episode,
+        "snapshot": snapshot,
         "status": 200,
         "size": size
     }

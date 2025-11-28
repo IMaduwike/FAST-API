@@ -258,64 +258,86 @@ async def _fetch_single_episode(id: str, episode: int, external_id: str, db):
 
 @router.post("/bulk-download-zip")
 async def bulk_download_zip(request: Request):
-    """
-    Streams ZIP file without loading everything in memory
-    Request body: {
-        "links": [
-            {"episode": 1, "direct_link": "..."},
-            ...
-        ],
-        "anime_title": "One Piece"
-    }
-    """
     body = await request.json()
-    links = body.get("links", [])
-    anime_title = body.get("anime_title", "Anime").replace(" ", "_")
+    links: List[Dict] = body.get("links", [])
+    anime_title: str = body.get("anime_title", "Anime").replace(" ", "_")
     
-    async def zip_generator():
-        """Generate ZIP file on-the-fly"""
+    if not links:
+        return {"status": 400, "message": "No links provided"}
+    
+    print(f"🔍 Starting ZIP creation for {len(links)} episodes")
+    
+    async def generate_zip():
+        """Stream ZIP file chunk by chunk"""
         
-        # Create a generator-based ZIP
-        import zipstream
+        # Create ZIP in memory
+        zip_buffer = io.BytesIO()
         
-        z = zipstream.ZipFile(mode='w', compression=zipstream.ZIP_DEFLATED)
-        
-        async with httpx.AsyncClient(timeout=300) as client:
-            for link_info in links:
-                episode = link_info.get("episode")
-                url = link_info.get("direct_link")
-                
-                if not url:
-                    continue
-                
-                filename = f"{anime_title}_Episode_{episode}.mp4"
-                
-                print(f"📥 Streaming episode {episode}...")
-                
-                try:
-                    response = await client.get(url, timeout=300)
+        async with httpx.AsyncClient(timeout=300, follow_redirects=True) as client:
+            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED, compresslevel=1) as zip_file:
+                for link_info in links:
+                    episode = link_info.get("episode")
+                    url = link_info.get("direct_link")
                     
-                    if response.status_code == 200:
-                        # Add file to ZIP from bytes
-                        z.write_iter(filename, iter([response.content]))
-                        print(f"✅ Added episode {episode}")
-                    else:
-                        print(f"❌ Failed episode {episode}: status {response.status_code}")
+                    if not url:
+                        print(f"⚠️ Skipping episode {episode}: No URL")
+                        continue
+                    
+                    filename = f"{anime_title}_Episode_{str(episode).zfill(3)}.mp4"
+                    
+                    print(f"📥 Downloading episode {episode}...")
+                    
+                    try:
+                        # Download episode
+                        response = await client.get(url, timeout=300)
                         
-                except Exception as e:
-                    print(f"❌ Error episode {episode}: {e}")
-                    continue
+                        print(f"📊 Episode {episode}: Status {response.status_code}, Size: {len(response.content)} bytes")
+                        
+                        if response.status_code == 200 and len(response.content) > 0:
+                            # Write to ZIP
+                            zip_file.writestr(filename, response.content)
+                            print(f"✅ Episode {episode} added to ZIP ({len(response.content)} bytes)")
+                        else:
+                            print(f"❌ Episode {episode} failed: HTTP {response.status_code}, Size: {len(response.content)}")
+                            
+                    except httpx.TimeoutException:
+                        print(f"❌ Episode {episode} timed out")
+                    except Exception as e:
+                        print(f"❌ Episode {episode} error: {str(e)}")
+                        continue
         
-        # Stream the ZIP
-        for chunk in z:
-            yield chunk
+        print(f"✅ ZIP creation complete! Total size: {zip_buffer.tell()} bytes")
+        
+        # Get ZIP content
+        zip_buffer.seek(0)
+        zip_content = zip_buffer.read()
+        
+        if len(zip_content) == 0:
+            print("⚠️ WARNING: ZIP file is empty!")
+        
+        # Stream in chunks
+        chunk_size = 64 * 1024  # 64KB chunks
+        for i in range(0, len(zip_content), chunk_size):
+            yield zip_content[i:i + chunk_size]
     
     filename = f"{anime_title}_Episodes.zip"
     
+    # Calculate total size estimate
+    total_size = 0
+    for link in links:
+        size_str = link.get("size", "0 MB")
+        try:
+            size_value = float(size_str.split()[0])
+            total_size += int(size_value * 1024 * 1024)
+        except:
+            pass
+    
     return StreamingResponse(
-        zip_generator(),
+        generate_zip(),
         media_type="application/zip",
         headers={
-            "Content-Disposition": f"attachment; filename={filename}"
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Type": "application/zip",
+            "Content-Length": str(int(total_size * 0.95)) if total_size > 0 else ""
         }
     )

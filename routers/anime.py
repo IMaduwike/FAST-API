@@ -1,11 +1,11 @@
-#Ok, bro i have a question or rather, an issue.. The snapshots return an error 403 because they're linked to the domain that requires animepahe cookies to continue.. so we get an error 403 and the images don't display.. Even in the search the images don't display they all have error 403 but when i add cookies? they work.. so me rn i don't know what to do.. I'm not saying u should send me code but just idk enlghten me on what to do ig?
 import uuid
 import json
+import traceback
 import io
 import zipfile
 import asyncio
 from fastapi import APIRouter, Query, Depends,Request
-from fastapi.responses import JSONResponse,StreamingResponse
+from fastapi.responses import JSONResponse,StreamingResponse,Response
 import httpx
 from db import get_db
 from helpers.anime_helper import get_pahewin_link,get_episode_session,get_kiwi_url,get_redirect_link
@@ -22,7 +22,7 @@ async def anime_search(query: str = Query(..., description="Anime name for the s
     search_result = []
     try:
         cookies = await get_animepahe_cookies()
-        async with httpx.AsyncClient(cookies=cookies,timeout=10) as client:
+        async with httpx.AsyncClient(cookies=cookies,timeout=30) as client:
             encode_query = await encodeURIComponent(query)
             res = await client.get(f"https://animepahe.si/api?m=search&q={encode_query}")
         try:
@@ -61,10 +61,18 @@ async def anime_search(query: str = Query(..., description="Anime name for the s
         return search_result
     except httpx.ConnectError:
         print("Connection error occured")
+        traceback.print_exc()
         return JSONResponse(status_code=500,content={
             "status":500,
             "message":"Connection error occured Try again later"
         })
+    except httpx.ConnectTimeout:
+        print("Connection error occured")
+        return JSONResponse(status_code=500,content={
+            "status":500,
+            "message":"Connection error occured Try again later"
+        })
+
     except Exception as e:
         print("Anime search error: ",e)
         traceback.print_exc()
@@ -179,10 +187,10 @@ async def anime_bulk_download(
     
     # Create list of episode numbers to fetch
     episodes = list(range(ep_from, ep_to + 1))
-    
+    semaphore = asyncio.Semaphore(5)
     # Fetch all episodes concurrently with asyncio.gather
     download_links = await asyncio.gather(*[
-        _fetch_single_episode(id, episode, info["external_id"], db)
+        _fetch_single_episode(id, episode, info["external_id"], db,semaphore)
         for episode in episodes
     ])
     
@@ -216,8 +224,9 @@ async def anime_bulk_download(
     })
 
 
-async def _fetch_single_episode(id: str, episode: int, external_id: str, db):
+async def _fetch_single_episode(id: str, episode: int, external_id: str, db, semaphore):
     """Helper function to fetch a single episode link"""
+      # Only N requests at once
     try:
         # Check cache first
         cursor = await db.execute(
@@ -228,21 +237,29 @@ async def _fetch_single_episode(id: str, episode: int, external_id: str, db):
         
         if row and row["video_url"]:
             link = row["video_url"]
-            async with httpx.AsyncClient(timeout=10) as client:
-                res = await client.head(link)
             
-            if res.status_code == 200:
-                print(f"✅ Episode {episode}: Using cached link")
-                return {
-                    "episode": row["episode"],
-                    "direct_link": row["video_url"],
-                    "size": row["size"],
-                    "snapshot": row["snapshot"],
-                    "status": 200
-                }
+            try:
+                async with httpx.AsyncClient(timeout=10) as client:
+                    res = await client.head(link)
+                
+                if res.status_code == 200:
+                    print(f"✅ Episode {episode}: Using cached link")
+                    return {
+                        "episode": row["episode"],
+                        "direct_link": row["video_url"],
+                        "size": row["size"],
+                        "snapshot": row["snapshot"],
+                        "status": 200
+                    }
+            except Exception as e:
+                print(f"⚠️ Episode {episode}: Cached link check failed ({e}), fetching fresh...")
         
         # Fetch fresh link
         print(f"🔄 Episode {episode}: Fetching fresh link")
+        
+        # Add delay between requests
+        await asyncio.sleep(0.5)
+        
         search_result = await get_episode_session(external_id, db)
         episode_info = search_result[episode - 1]
         episode_session = episode_info.get("session")
@@ -269,8 +286,9 @@ async def _fetch_single_episode(id: str, episode: int, external_id: str, db):
             
     except Exception as e:
         print(f"❌ Episode {episode}: Error - {e}")
+        import traceback
+        traceback.print_exc()
         return None
-
 import os
 import tempfile
 import shutil
@@ -298,13 +316,21 @@ async def bulk_download_zip_get(
         return JSONResponse(status_code=404, content={"status": 404, "message": "Session not found"})
     
     links = json.loads(row["links"])
-    anime_title = row["anime_title"].replace(" ", "_")
+    anime_title = row["anime_title"].replace(" ", "_").lower()
     
-    print(f"🔍 Creating ZIP for {anime_title} with {len(links)} episodes")
+    # Get episode range
+    episodes = [link_info.get("episode") for link_info in links if link_info.get("episode")]
+    from_ep = min(episodes) if episodes else 1
+    to_ep = max(episodes) if episodes else 1
+    
+    # Create filename: gachiakuta_19-21_episodes.zip
+    zip_filename = f"{anime_title}_{from_ep}-{to_ep}_episodes.zip"
+    
+    print(f"🔍 Creating ZIP for {anime_title} with {len(links)} episodes ({from_ep}-{to_ep})")
     
     # Create temporary directory
     temp_dir = tempfile.mkdtemp()
-    zip_path = os.path.join(temp_dir, f"{anime_title}_Episodes.zip")
+    zip_path = os.path.join(temp_dir, zip_filename)
     
     try:
         headers = {
@@ -373,12 +399,12 @@ async def bulk_download_zip_get(
         await db.execute("DELETE FROM download_sessions WHERE session_id = ?", (session_id,))
         await db.commit()
         
-        # Return streaming response
+        # Return streaming response with proper filename
         response = StreamingResponse(
             iterate_file(),
             media_type="application/zip",
             headers={
-                "Content-Disposition": f'attachment; filename="{anime_title}_Episodes.zip"',
+                "Content-Disposition": f'attachment; filename="{zip_filename}"',
                 "Content-Length": str(zip_size)  # Exact size!
             }
         )
@@ -398,3 +424,40 @@ async def bulk_download_zip_get(
         shutil.rmtree(temp_dir, ignore_errors=True)
         print(f"❌ Error: {e}")
         return JSONResponse(status_code=500, content={"status": 500, "message": str(e)})
+
+@router.get("/proxy-image", description="Proxy images from animepahe")
+async def proxy_image(
+    url: str = Query(..., description="Image URL to proxy")
+):
+    """
+    Proxy images from animepahe with cookies to bypass 403
+    """
+    
+    # Validate it's from animepahe (security)
+    if "animepahe.si" not in url:
+        return Response(status_code=400, content="Invalid image URL")
+    
+    try:
+        # Get animepahe cookies
+        cookies = await get_animepahe_cookies()
+        
+        # Fetch image with cookies
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.get(url, cookies=cookies)
+        
+        if response.status_code == 200:
+            # Return image with proper content type
+            return Response(
+                content=response.content,
+                media_type=response.headers.get("content-type", "image/jpeg"),
+                headers={
+                    "Cache-Control": "public, max-age=86400",  # Cache for 1 day
+                }
+            )
+        else:
+            # Return placeholder or 404
+            return Response(status_code=response.status_code)
+            
+    except Exception as e:
+        print(f"Error proxying image: {e}")
+        return Response(status_code=500)

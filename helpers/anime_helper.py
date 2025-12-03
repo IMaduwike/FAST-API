@@ -81,21 +81,28 @@ async def get_animepahe_cookies():
         return None  # No cookies available
 
 async def get_actual_episode(external_id):
-    if not external_id:
-        return None
-    cookies = await get_animepahe_cookies()
-    
-    async with httpx.AsyncClient() as client:
-        res = await client.get(
-            f"https://animepahe.si/api?m=release&id={external_id}",
-            cookies=cookies,
-            timeout=10
-        )
-    if res.status_code != 200:
-        return None
-    data = res.json()
+    try:
+        if not external_id:
+            return None
+        cookies = await get_animepahe_cookies()
+        
+        async with httpx.AsyncClient() as client:
+            res = await client.get(
+                f"https://animepahe.si/api?m=release&id={external_id}",
+                cookies=cookies,
+                timeout=30
+            )
+        if res.status_code != 200:
+            return None
+        data = res.json()
 
-    return data.get("total")
+        return data.get("total")
+    except httpx.ConnectTimeout:
+        print("Connection error")
+        return None
+    except Exception as e:
+        print(e)
+        return None
 
 async def get_cached_anime_info(id, db):
     try:
@@ -141,19 +148,22 @@ async def get_cached_anime_info(id, db):
         traceback.print_exc()
         return {"status": 500, "message": f"Internal error: {str(e)}"}
 
-async def get_episode_session(id,db):
+async def get_episode_session(id, db):
     if not id:
         return None
+    
     cookies = await get_animepahe_cookies()
-    episode_result = []
+    
     cursor = await db.execute(
         "SELECT page_count FROM anime_episode WHERE external_id = ?", (id,))
     row = await cursor.fetchone()
     print("Running get_episode_session function")
+    
     if not row or not row["page_count"]:
-        async with httpx.AsyncClient(cookies=cookies,timeout=10) as client:
+        async with httpx.AsyncClient(cookies=cookies, timeout=10) as client:
             res = await client.get(f"https://animepahe.si/api?m=release&id={id}")
             data = res.json()
+        
         if not data or not data.get("last_page"):
             return None
 
@@ -165,24 +175,36 @@ async def get_episode_session(id,db):
         page_count = data.get("last_page")
     else:
         page_count = row["page_count"]
-    print("Gotten to the loop stage")
+    
+    print(f"Fetching {page_count} pages concurrently")
+    
+    async def fetch_page(client, page, delay):
+        # Stagger requests with delay
+        await asyncio.sleep(delay)
+        
+        url = (
+            f"https://animepahe.si/api"
+            f"?m=release&id={id}&sort=episode_asc&page={page}"
+        )
+        res = await client.get(url, cookies=cookies)
+        return res.json().get("data", [])
+    
     async with httpx.AsyncClient(timeout=10.0) as client:
-        for page in range(1, page_count + 1):
-            url = (
-                f"https://animepahe.si/api"
-                f"?m=release&id={id}&sort=episode_asc&page={page}"
-            )
-
-            res = await client.get(url, cookies=cookies)
-            data = res.json()
-
-            episode_result.extend(data.get("data", []))
-
-            # async sleep to avoid blocking the event loop
-            await asyncio.sleep(1.5)
-        print("Done with the loop")
+        # Create tasks with staggered delays (0.5s between each)
+        tasks = [
+            fetch_page(client, page, page * 0.5)
+            for page in range(1, page_count + 1)
+        ]
+        
+        # Fetch all pages concurrently
+        results = await asyncio.gather(*tasks)
+    
+    # Flatten the results
+    episode_result = [episode for page_data in results for episode in page_data]
+    
+    print("Done with concurrent fetching")
     return episode_result
-
+    
 async def get_pahewin_link(external_id, episode_id):
     if not episode_id or not external_id:
         return None

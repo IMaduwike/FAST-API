@@ -8,7 +8,8 @@ from slowapi.util import get_remote_address
 from fastapi import Request
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
-from routers.tiktok import router as tiktok_router, file_router
+from routers.tiktok import router as tiktok_router
+from routers.file import file_router
 from routers.anime import router as anime_router
 from helpers.anime_helper import get_animepahe_cookies
 

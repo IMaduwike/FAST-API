@@ -8,83 +8,102 @@ import httpx
 from playwright.async_api import async_playwright,TimeoutError
 from utils.helper import deobfuscate,extract_info
 
-def cookies_expired(cookie_dict):
+async def cookies_expired(db):
+    """Check if __ddg2 cookie is expired"""
     now = time.time()
-    for c in cookie_dict.values():
-        exp = c.get("expires")
-        if exp and exp < now:
-            return True
-    return False
+    
+    cursor = await db.execute(
+        "SELECT value, expires FROM cookies WHERE name = ?", 
+        ("__ddg2",)
+    )
+    row = await cursor.fetchone()
+    
+    if not row:
+        print(f"❌ __ddg2 cookie missing from database")
+        return True
+    
+    exp = row["expires"]
+    if not exp:
+        print(f"❌ __ddg2 has no expiry field")
+        return True
+    
+    is_expired = exp < now
+    return is_expired
 
 
-CACHE_FILE = "animepahe_cookies.json"
-
-
-
-
-CACHE_FILE = "animepahe_cookies.json"
-
-async def get_animepahe_cookies():
+async def get_animepahe_cookies(db):
+    """Get cookies from SQLite database, refresh if expired"""
+    
     # 1️⃣ Check if cached cookies exist and are still valid
-    if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, "r") as f:
-            data = json.load(f)
-        if not cookies_expired(data):  # Your existing expiry check
-            print("Used cookies from Cached")
-            return {k: v["value"] for k, v in data.items()}
-
-    # 2️⃣ Else: try to regenerate cookies
+    cursor = await db.execute("SELECT COUNT(*) as count FROM cookies")
+    row = await cursor.fetchone()
+    
+    if row["count"] > 0:
+        if not await cookies_expired(db):
+            
+            # Fetch all cookies
+            cursor = await db.execute("SELECT name, value FROM cookies")
+            rows = await cursor.fetchall()
+            return {row["name"]: row["value"] for row in rows}
+        else:
+            print("⚠️ Cookies expired, fetching new ones...")
+    
+    # 2️⃣ Cookies expired or don't exist - use Playwright
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             context = await browser.new_context()
             page = await context.new_page()
-
+            
             # Go to Animepahe
             await page.goto("https://animepahe.si")
-
-            # Wait for main content to load, not full network idle
+            
+            # Wait for main content to load
             try:
                 await page.wait_for_load_state("domcontentloaded", timeout=10000)
             except TimeoutError:
                 print("⚠️ Timeout waiting for DOMContentLoaded, continuing anyway...")
-
-            # Optional small sleep to ensure cookies are set
+            
+            # Small sleep to ensure cookies are set
             await asyncio.sleep(1)
-
+            
             cookies = await context.cookies()
             await browser.close()
-
-            # Prepare cookie dict
-            cookie_dict = {
-                c['name']: {
-                    "value": c['value'],
-                    "expires": c.get("expires")
-                }
-                for c in cookies
-            }
-
-            # Save to cache
-            with open(CACHE_FILE, "w") as f:
-                json.dump(cookie_dict, f)
-            print("Used cookies from animepahe server")
-            return {k: v["value"] for k, v in cookie_dict.items()}
-
+            
+            # Clear old cookies and insert new ones
+            await db.execute("DELETE FROM cookies")
+            
+            for cookie in cookies:
+                await db.execute(
+                    "INSERT INTO cookies (name, value, expires) VALUES (?, ?, ?)",
+                    (cookie['name'], cookie['value'], cookie.get('expires'))
+                )
+            
+            await db.commit()
+            
+            print("✅ Used fresh cookies from animepahe server")
+            
+            # Return cookies as dict
+            return {c['name']: c['value'] for c in cookies}
+            
     except Exception as e:
-        print("⚠️ Failed to get new cookies:", e)
-        # Fallback: return cached cookies if they exist, even if expired
-        if os.path.exists(CACHE_FILE):
-            with open(CACHE_FILE, "r") as f:
-                data = json.load(f)
-                print("Cookies gotten through the try except method")
-            return {k: v["value"] for k, v in data.items()}
-        return None  # No cookies available
+        print(f"❌ Failed to get new cookies: {e}")
+        
+        # Fallback: return cached cookies even if expired (better than nothing)
+        cursor = await db.execute("SELECT name, value FROM cookies")
+        rows = await cursor.fetchall()
+        
+        if rows:
+            print("⚠️ Using expired cached cookies as fallback")
+            return {row["name"]: row["value"] for row in rows}
+        
+        return None  # No cookies available at all
 
-async def get_actual_episode(external_id):
+async def get_actual_episode(external_id,db):
     try:
         if not external_id:
             return None
-        cookies = await get_animepahe_cookies()
+        cookies = await get_animepahe_cookies(db)
         
         async with httpx.AsyncClient() as client:
             res = await client.get(
@@ -124,7 +143,7 @@ async def get_cached_anime_info(id, db):
             return {"status": 400, "message": "No external_id found for this anime"}
         
         # Get actual episode count
-        episodes = await get_actual_episode(external_id)
+        episodes = await get_actual_episode(external_id,db)
         
         if not episodes:
             return {"status": 500, "message": "Failed to fetch episode count"}
@@ -140,7 +159,6 @@ async def get_cached_anime_info(id, db):
             row = await cursor.fetchone()
         if not row:
             return {"status":404,"message":"Id not registered. Search the anime first"}
-        print("Cached anime info function ran")
         return {"status": 200, **row}
     
     except Exception as e:
@@ -152,12 +170,11 @@ async def get_episode_session(id, db):
     if not id:
         return None
     
-    cookies = await get_animepahe_cookies()
+    cookies = await get_animepahe_cookies(db)
     
     cursor = await db.execute(
         "SELECT page_count FROM anime_episode WHERE external_id = ?", (id,))
     row = await cursor.fetchone()
-    print("Running get_episode_session function")
     
     if not row or not row["page_count"]:
         async with httpx.AsyncClient(cookies=cookies, timeout=10) as client:
@@ -177,7 +194,6 @@ async def get_episode_session(id, db):
     else:
         page_count = row["page_count"]
     
-    print(f"Fetching {page_count} pages concurrently")
     
     async def fetch_page(client, page, delay):
         # Stagger requests with delay
@@ -203,16 +219,14 @@ async def get_episode_session(id, db):
     # Flatten the results
     episode_result = [episode for page_data in results for episode in page_data]
     
-    print("Done with concurrent fetching")
     return episode_result
     
-async def get_pahewin_link(external_id, episode_id):
+async def get_pahewin_link(external_id, episode_id,db):
     if not episode_id or not external_id:
         return None
     
     url = f"https://animepahe.si/play/{external_id}/{episode_id}"
-    cookies = await get_animepahe_cookies()
-    print("Getting anime pahe cookies in get_pahewin_link function")
+    cookies = await get_animepahe_cookies(db)
     
     # Use httpx for async HTTP request
     async with httpx.AsyncClient() as client:
@@ -235,8 +249,6 @@ def _parse_pahewin_html(html, url):
     for a in links:
         text = a.get_text(" ", strip=True).lower()
         if "720p" in text and "eng" not in text:
-            print(f"Gotten pahe.win link successfully for {url}")
-            print(f"Pahe.win link:{a['href']}")
             return a["href"]
     
     print("No link found")
@@ -368,8 +380,6 @@ async def get_redirect_link(url, id, episode, db,snapshot):
         (id, episode, direct_link, size,snapshot)
     )
     await db.commit()
-    
-    print(f"Direct url {direct_link} detected sending response now")
     return {
         "direct_link": direct_link,
         "episode": episode,

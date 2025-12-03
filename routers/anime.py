@@ -21,7 +21,7 @@ async def anime_search(query: str = Query(..., description="Anime name for the s
         })
     search_result = []
     try:
-        cookies = await get_animepahe_cookies()
+        cookies = await get_animepahe_cookies(db)
         async with httpx.AsyncClient(cookies=cookies,timeout=30) as client:
             encode_query = await encodeURIComponent(query)
             res = await client.get(f"https://animepahe.si/api?m=search&q={encode_query}")
@@ -39,7 +39,7 @@ async def anime_search(query: str = Query(..., description="Anime name for the s
             cursor = await db.execute(
                 "SELECT internal_id FROM anime_info WHERE external_id = ?", (i.get("session"),))
             row = await cursor.fetchone()
-            episodes = await get_actual_episode(i.get("session")) if i.get(
+            episodes = await get_actual_episode(i.get("session"),db) if i.get(
                 "episodes") == 0 or i.get("status") == "Currently Airing" else i.get("episodes")
             if not row:
                 internal_id = await generate_internal_id(i.get("title"))
@@ -126,7 +126,6 @@ async def anime_download(id:str = Query(...,description="id for the anime from s
         async with httpx.AsyncClient(timeout=10) as client:
             res = await client.head(link)
         if res.status_code == 200:
-            print("Link is a valid link with a status code of 200")
             return {
                 "status": 200,
                 "direct_link": row["video_url"],
@@ -219,7 +218,6 @@ async def anime_bulk_download(
     )
     await db.commit()
     
-    print(f"✅ Created session {session_id} for {info.get('title')}")
     
     return JSONResponse(status_code=200, content={
         "status": 200,
@@ -250,7 +248,6 @@ async def _fetch_single_episode(id: str, episode: int, external_id: str, db, sem
                     res = await client.head(link)
                 
                 if res.status_code == 200:
-                    print(f"✅ Episode {episode}: Using cached link")
                     return {
                         "episode": row["episode"],
                         "direct_link": row["video_url"],
@@ -262,7 +259,6 @@ async def _fetch_single_episode(id: str, episode: int, external_id: str, db, sem
                 print(f"⚠️ Episode {episode}: Cached link check failed ({e}), fetching fresh...")
         
         # Fetch fresh link
-        print(f"🔄 Episode {episode}: Fetching fresh link")
         
         # Add delay between requests
         await asyncio.sleep(0.5)
@@ -272,7 +268,7 @@ async def _fetch_single_episode(id: str, episode: int, external_id: str, db, sem
         episode_session = episode_info.get("session")
         episode_snapshot = episode_info.get("snapshot")
         
-        pahe_link = await get_pahewin_link(external_id, episode_session)
+        pahe_link = await get_pahewin_link(external_id, episode_session,db)
         if not pahe_link:
             print(f"❌ Episode {episode}: No pahe link found")
             return None
@@ -285,7 +281,6 @@ async def _fetch_single_episode(id: str, episode: int, external_id: str, db, sem
         results = await get_redirect_link(kiwi_url, id, episode, db, episode_snapshot)
         
         if results and results.get("status") == 200:
-            print(f"✅ Episode {episode}: Successfully fetched")
             return results
         else:
             print(f"❌ Episode {episode}: Failed to get redirect link")
@@ -310,7 +305,6 @@ async def bulk_download_zip_get(
     Uses 2x bandwidth but WORKS every time!
     """
     
-    print(f"🔍 Fetching session {session_id}")
     
     # Get session
     cursor = await db.execute(
@@ -333,7 +327,6 @@ async def bulk_download_zip_get(
     # Create filename: gachiakuta_19-21_episodes.zip
     zip_filename = f"{anime_title}_{from_ep}-{to_ep}_episodes.zip"
     
-    print(f"🔍 Creating ZIP for {anime_title} with {len(links)} episodes ({from_ep}-{to_ep})")
     
     # Create temporary directory
     temp_dir = tempfile.mkdtemp()
@@ -359,7 +352,6 @@ async def bulk_download_zip_get(
                 filename = f"{anime_title}_Episode_{str(episode).zfill(3)}.mp4"
                 filepath = os.path.join(temp_dir, filename)
                 
-                print(f"📥 Downloading episode {episode} to disk...")
                 
                 try:
                     response = await client.get(url, timeout=300)
@@ -370,7 +362,6 @@ async def bulk_download_zip_get(
                             f.write(response.content)
                         
                         downloaded_files.append(filepath)
-                        print(f"✅ Episode {episode} saved to disk")
                     else:
                         print(f"❌ Episode {episode} failed: {response.status_code}")
                 
@@ -382,15 +373,12 @@ async def bulk_download_zip_get(
             return JSONResponse(status_code=500, content={"status": 500, "message": "No episodes downloaded"})
         
         # Step 2: Create ZIP from downloaded files
-        print(f"📦 Creating ZIP file...")
         
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_STORED) as zip_file:
             for filepath in downloaded_files:
                 zip_file.write(filepath, os.path.basename(filepath))
-                print(f"✅ Added {os.path.basename(filepath)} to ZIP")
         
         zip_size = os.path.getsize(zip_path)
-        print(f"✅ ZIP created! Size: {zip_size / (1024*1024):.2f} MB")
         
         # Step 3: Stream the ZIP file
         def iterate_file():
@@ -434,7 +422,7 @@ async def bulk_download_zip_get(
 
 @router.get("/proxy-image", description="Proxy images from animepahe")
 async def proxy_image(
-    url: str = Query(..., description="Image URL to proxy")
+    url: str = Query(..., description="Image URL to proxy"), db= Depends(get_db)
 ):
     """
     Proxy images from animepahe with cookies to bypass 403
@@ -446,7 +434,7 @@ async def proxy_image(
     
     try:
         # Get animepahe cookies
-        cookies = await get_animepahe_cookies()
+        cookies = await get_animepahe_cookies(db)
         
         # Fetch image with cookies
         async with httpx.AsyncClient(timeout=10) as client:

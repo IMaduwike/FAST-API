@@ -57,7 +57,6 @@ app.include_router(file_router)
 # ---------------- DATABASE INIT ----------------
 @app.on_event("startup")
 async def startup():
-    await get_animepahe_cookies()
     async with aiosqlite.connect("cache.db") as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS videos (
@@ -77,7 +76,15 @@ async def startup():
                 external_id TEXT NOT NULL UNIQUE
             )
         """)
-
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS cookies (
+            name TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            expires REAL,
+            created_at REAL DEFAULT (strftime('%s', 'now'))
+);
+        
+        """)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS anime_episode (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -91,7 +98,6 @@ async def startup():
             CREATE TABLE IF NOT EXISTS cached_video_url (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 internal_id TEXT NOT NULL,
-                episode TEXT,
                 video_url TEXT,
                 size TEXT,
                 snapshot TEXT,
@@ -104,6 +110,7 @@ async def startup():
     anime_id TEXT NOT NULL,
     anime_title TEXT NOT NULL,
     links TEXT NOT NULL,
+                episode TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );      
         """)

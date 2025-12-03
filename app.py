@@ -102,6 +102,7 @@ async def startup():
                 video_url TEXT,
                 size TEXT,
                 snapshot TEXT,
+                episode TEXT,
                 UNIQUE(internal_id, episode)
             )
         """)
@@ -111,7 +112,6 @@ async def startup():
     anime_id TEXT NOT NULL,
     anime_title TEXT NOT NULL,
     links TEXT NOT NULL,
-                episode TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );      
         """)

@@ -1,4 +1,4 @@
-from fastapi import FastAPI,Depends
+from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import aiosqlite
@@ -8,57 +8,40 @@ from slowapi.util import get_remote_address
 from fastapi import Request
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
+from contextlib import asynccontextmanager
 from routers.tiktok import router as tiktok_router
 from routers.file import file_router
 from db import get_db
+from database import init_db, close_db  # PostgreSQL functions
+from routers.analytics import router as analytics_router
 from routers.anime import router as anime_router
 from helpers.anime_helper import get_animepahe_cookies
 
 load_dotenv()
+
 limiter = Limiter(
     key_func=get_remote_address,
     default_limits=["40/minute"],
     headers_enabled=True,
 )
 
-app = FastAPI(
-    title="FAST-API Service",
-    description="API for TikTok downloader and Anime scraper",
-    version="1.0.0",
-)
-app.state.limiter = limiter
-# ---------------- CORS ----------------
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://localhost:3000"
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-app.add_middleware(SlowAPIMiddleware)
-@app.exception_handler(RateLimitExceeded)
-async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
-    return JSONResponse(
-        status_code=429,
-        content={
-            "error": "Rate limit exceeded",
-            "message": "You have sent too many requests. Try again in 15 minutes.",
-            "retry_after_minutes": 15
-        }
-    )
-
-# ---------------- ROUTERS ----------------
-app.include_router(tiktok_router)
-app.include_router(anime_router)
-app.include_router(file_router)
-
-# ---------------- DATABASE INIT ----------------
-@app.on_event("startup")
-async def startup():
+# ---------------- LIFESPAN CONTEXT MANAGER ----------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Startup and shutdown events
+    """
+    # STARTUP
+    print("🔌 Starting services...")
+    
+    # 1. Initialize PostgreSQL (for analytics)
+    await init_db()
+    print("✅ PostgreSQL ready!")
+    
+    # 2. Initialize SQLite (for caching)
     async with aiosqlite.connect("cache.db") as db:
+        print("📦 Setting up SQLite cache...")
+        
         await db.execute("""
             CREATE TABLE IF NOT EXISTS videos (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -77,15 +60,16 @@ async def startup():
                 external_id TEXT NOT NULL UNIQUE
             )
         """)
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS cookies (
-            name TEXT PRIMARY KEY,
-            value TEXT NOT NULL,
-            expires REAL,
-            created_at REAL DEFAULT (strftime('%s', 'now'))
-);
         
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS cookies (
+                name TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                expires REAL,
+                created_at REAL DEFAULT (strftime('%s', 'now'))
+            )
         """)
+        
         await db.execute("""
             CREATE TABLE IF NOT EXISTS anime_episode (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -106,17 +90,70 @@ async def startup():
                 UNIQUE(internal_id, episode)
             )
         """)
+        
         await db.execute("""
-        CREATE TABLE IF NOT EXISTS download_sessions (
-    session_id TEXT PRIMARY KEY,
-    anime_id TEXT NOT NULL,
-    anime_title TEXT NOT NULL,
-    links TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);      
+            CREATE TABLE IF NOT EXISTS download_sessions (
+                session_id TEXT PRIMARY KEY,
+                anime_id TEXT NOT NULL,
+                anime_title TEXT NOT NULL,
+                links TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
         """)
 
         await db.commit()
+        print("✅ SQLite cache ready!")
+    
+    print("🚀 Application started!")
+    
+    yield
+    
+    # SHUTDOWN
+    print("🛑 Shutting down services...")
+    await close_db()
+    print("👋 Application stopped!")
+
+
+# ---------------- CREATE APP WITH LIFESPAN ----------------
+app = FastAPI(
+    title="FAST-API Service",
+    description="API for TikTok downloader and Anime scraper",
+    version="1.0.0",
+    lifespan=lifespan  # ← THIS IS THE KEY!
+)
+
+app.state.limiter = limiter
+
+# ---------------- CORS ----------------
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://localhost:5174",
+        "http://localhost:3000"
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+app.add_middleware(SlowAPIMiddleware)
+
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    return JSONResponse(
+        status_code=429,
+        content={
+            "error": "Rate limit exceeded",
+            "message": "You have sent too many requests. Try again in 15 minutes.",
+            "retry_after_minutes": 15
+        }
+    )
+
+# ---------------- ROUTERS ----------------
+app.include_router(tiktok_router)
+app.include_router(anime_router)
+app.include_router(file_router)
+app.include_router(analytics_router)
 
 # ---------------- ROOT ROUTE ----------------
 @app.get(
@@ -125,7 +162,7 @@ async def startup():
     summary="API Root",
     description="Welcome message and available information about the API.",
 )
-async def root(db= Depends(get_db)):
+async def root(db=Depends(get_db)):
     await get_animepahe_cookies(db)
     return {
         "message": "Welcome to the FAST-API Service 🚀",

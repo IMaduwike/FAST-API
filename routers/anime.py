@@ -166,7 +166,15 @@ async def anime_bulk_download(
             "status": 400,
             "message": "Starting episode cannot be greater than ending episode"
         })
-    
+    total_ep_count = ep_to - ep_from
+    if total_ep_count >= 100:
+        return JSONResponse(status_code=400,
+        content= {
+            "status":400,
+            "message":"Limit reached. Must be less than 100 episodes."
+        }
+        )
+
     # Get anime info
     info = await get_cached_anime_info(id, db)
     if not info.get("status") == 200:

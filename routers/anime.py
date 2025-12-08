@@ -311,9 +311,17 @@ async def _fetch_single_episode(id: str, episode: int, external_id: str, db,qual
         import traceback
         traceback.print_exc()
         return None
+
 import os
+import json
+import asyncio
 import tempfile
 import shutil
+from pathlib import Path
+from zipfile import ZipFile, ZIP_DEFLATED
+import httpx
+from fastapi import Query, Depends
+from fastapi.responses import StreamingResponse, JSONResponse
 
 @router.get("/bulk-download-zip")
 async def bulk_download_zip_get(
@@ -321,10 +329,8 @@ async def bulk_download_zip_get(
     db = Depends(get_db)
 ):
     """
-    Download episodes to disk, ZIP them, stream, then delete
-    Uses 2x bandwidth but WORKS every time!
+    Stream ZIP using temporary files with retry logic
     """
-    
     
     # Get session
     cursor = await db.execute(
@@ -340,105 +346,180 @@ async def bulk_download_zip_get(
     anime_title = row["anime_title"].replace(" ", "_").lower()
     
     # Get episode range
-    episodes = [link_info.get("episode") for link_info in links if link_info.get("episode")]
+    episodes = [int(link_info.get("episode")) for link_info in links if link_info.get("episode")]
     from_ep = min(episodes) if episodes else 1
     to_ep = max(episodes) if episodes else 1
     
-    # Create filename: gachiakuta_19-21_episodes.zip
     zip_filename = f"{anime_title}_{from_ep}-{to_ep}_episodes.zip"
     
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Referer': 'https://kwik.cx/',
+    }
     
-    # Create temporary directory
-    temp_dir = tempfile.mkdtemp()
-    zip_path = os.path.join(temp_dir, zip_filename)
-    
-    try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Referer': 'https://kwik.cx/',
-        }
+    async def download_with_retry(client, url, temp_file, episode, max_retries=3):
+        """Download file with retry and resume support"""
         
-        # Step 1: Download all episodes to disk
-        downloaded_files = []
-        
-        async with httpx.AsyncClient(timeout=300, follow_redirects=True, headers=headers) as client:
-            for link_info in links:
-                episode = link_info.get("episode")
-                url = link_info.get("direct_link")
+        for attempt in range(max_retries):
+            try:
+                # Check if file exists (for resume)
+                start_byte = 0
+                if os.path.exists(temp_file):
+                    start_byte = os.path.getsize(temp_file)
+                    print(f"🔄 Resuming from {start_byte / 1024 / 1024:.2f} MB")
                 
-                if not url:
-                    continue
+                # Add range header for resume
+                download_headers = headers.copy()
+                if start_byte > 0:
+                    download_headers['Range'] = f'bytes={start_byte}-'
                 
-                filename = f"{anime_title}_Episode_{str(episode).zfill(3)}.mp4"
-                filepath = os.path.join(temp_dir, filename)
-                
-                
-                try:
-                    response = await client.get(url, timeout=300)
+                # Download
+                async with client.stream('GET', url, headers=download_headers, timeout=120.0) as response:
+                    # Check if resume is supported
+                    if start_byte > 0 and response.status_code not in [206, 200]:
+                        print(f"⚠️ Resume not supported, starting fresh")
+                        start_byte = 0
+                        os.remove(temp_file) if os.path.exists(temp_file) else None
+                        return await download_with_retry(client, url, temp_file, episode, max_retries - attempt)
                     
-                    if response.status_code == 200 and len(response.content) > 100000:
-                        # Save to disk
-                        with open(filepath, 'wb') as f:
-                            f.write(response.content)
+                    response.raise_for_status()
+                    
+                    # Get total size
+                    content_length = response.headers.get('content-length')
+                    total_size = int(content_length) if content_length else None
+                    
+                    # Open file in append mode if resuming
+                    mode = 'ab' if start_byte > 0 else 'wb'
+                    with open(temp_file, mode) as f:
+                        downloaded = start_byte
+                        last_print = 0
                         
-                        downloaded_files.append(filepath)
-                    else:
-                        print(f"❌ Episode {episode} failed: {response.status_code}")
+                        async for chunk in response.aiter_bytes(chunk_size=1024*1024):
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            
+                            # Print progress every 50MB
+                            if downloaded - last_print >= 50 * 1024 * 1024:
+                                if total_size:
+                                    progress = (downloaded / total_size) * 100
+                                    print(f"📥 Episode {episode}: {downloaded / 1024 / 1024:.1f} MB / {total_size / 1024 / 1024:.1f} MB ({progress:.1f}%)")
+                                else:
+                                    print(f"📥 Episode {episode}: {downloaded / 1024 / 1024:.1f} MB")
+                                last_print = downloaded
+                    
+                    print(f"✅ Downloaded Episode {episode} ({downloaded / 1024 / 1024:.2f} MB)")
+                    return True
+                    
+            except (httpx.RemoteProtocolError, httpx.ReadTimeout, httpx.ConnectError) as e:
+                print(f"⚠️ Episode {episode} attempt {attempt + 1}/{max_retries} failed: {e}")
                 
-                except Exception as e:
-                    print(f"❌ Episode {episode} error: {e}")
-                    continue
+                if attempt < max_retries - 1:
+                    wait_time = (attempt + 1) * 2  # 2s, 4s, 6s
+                    print(f"⏳ Retrying in {wait_time}s...")
+                    await asyncio.sleep(wait_time)
+                else:
+                    print(f"❌ Episode {episode} failed after {max_retries} attempts")
+                    return False
+                    
+            except Exception as e:
+                print(f"❌ Episode {episode} unexpected error: {e}")
+                return False
         
-        if not downloaded_files:
-            return JSONResponse(status_code=500, content={"status": 500, "message": "No episodes downloaded"})
+        return False
+    
+    async def stream_zip():
+        """Stream ZIP file with temp storage and retry logic"""
+        temp_dir = None
+        zip_path = None
         
-        # Step 2: Create ZIP from downloaded files
-        
-        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_STORED) as zip_file:
-            for filepath in downloaded_files:
-                zip_file.write(filepath, os.path.basename(filepath))
-        
-        zip_size = os.path.getsize(zip_path)
-        
-        # Step 3: Stream the ZIP file
-        def iterate_file():
+        try:
+            # Create temp directory
+            temp_dir = tempfile.mkdtemp()
+            zip_path = os.path.join(temp_dir, "output.zip")
+            
+            print(f"📁 Temp dir: {temp_dir}")
+            
+            # Track successful downloads
+            successful_episodes = []
+            
+            # Download all episodes first
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(120.0, connect=30.0),
+                limits=httpx.Limits(max_keepalive_connections=5, max_connections=10)
+            ) as client:
+                for idx, link_info in enumerate(links, 1):
+                    episode = link_info.get("episode")
+                    url = link_info.get("direct_link")
+                    
+                    if not url:
+                        continue
+                    
+                    temp_file = os.path.join(temp_dir, f"ep_{episode}.mp4")
+                    
+                    print(f"\n🎬 [{idx}/{len(links)}] Starting Episode {episode}...")
+                    
+                    success = await download_with_retry(client, url, temp_file, episode)
+                    
+                    if success:
+                        successful_episodes.append({
+                            'episode': episode,
+                            'temp_file': temp_file,
+                            'filename': f"{anime_title}_Episode_{str(episode).zfill(3)}.mp4"
+                        })
+                    else:
+                        # Clean up failed download
+                        if os.path.exists(temp_file):
+                            os.remove(temp_file)
+            
+            if not successful_episodes:
+                raise Exception("No episodes downloaded successfully!")
+            
+            print(f"\n📦 Creating ZIP with {len(successful_episodes)} episodes...")
+            
+            # Create ZIP file
+            with ZipFile(zip_path, 'w', ZIP_DEFLATED) as zipf:
+                for ep_info in successful_episodes:
+                    zipf.write(ep_info['temp_file'], ep_info['filename'])
+                    print(f"📦 Added: {ep_info['filename']}")
+                    # Delete temp file after adding to ZIP
+                    os.remove(ep_info['temp_file'])
+            
+            zip_size = os.path.getsize(zip_path) / 1024 / 1024
+            print(f"✨ ZIP created! Size: {zip_size:.2f} MB")
+            print(f"✨ Successfully packed {len(successful_episodes)}/{len(links)} episodes")
+            
+            # Stream the ZIP file
             with open(zip_path, 'rb') as f:
-                chunk_size = 64 * 1024
+                chunk_size = 1024 * 1024  # 1MB chunks
                 while True:
                     chunk = f.read(chunk_size)
                     if not chunk:
                         break
                     yield chunk
-        
-        # Delete session
-        await db.execute("DELETE FROM download_sessions WHERE session_id = ?", (session_id,))
-        await db.commit()
-        
-        # Return streaming response with proper filename
-        response = StreamingResponse(
-            iterate_file(),
-            media_type="application/zip",
-            headers={
-                "Content-Disposition": f'attachment; filename="{zip_filename}"',
-                "Content-Length": str(zip_size)  # Exact size!
-            }
-        )
-        
-        # Schedule cleanup after response is sent
-        async def cleanup():
-            await asyncio.sleep(5)  # Wait for download to start
-            shutil.rmtree(temp_dir, ignore_errors=True)
-            print(f"🗑️ Cleaned up temp directory")
-        
-        asyncio.create_task(cleanup())
-        
-        return response
+                    
+        except Exception as e:
+            print(f"💥 Fatal error: {e}")
+            raise
+            
+        finally:
+            # Cleanup temp files
+            if temp_dir and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir)
+                print(f"🧹 Cleaned up temp dir")
     
-    except Exception as e:
-        # Cleanup on error
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        print(f"❌ Error: {e}")
-        return JSONResponse(status_code=500, content={"status": 500, "message": str(e)})
+    # Delete session
+    await db.execute("DELETE FROM download_sessions WHERE session_id = ?", (session_id,))
+    await db.commit()
+    
+    # Stream the ZIP
+    return StreamingResponse(
+        stream_zip(),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{zip_filename}"',
+            "Content-Type": "application/zip"
+        }
+    )
 
 @router.get("/proxy-image", description="Proxy images from animepahe")
 async def proxy_image(

@@ -172,56 +172,44 @@ async def get_episode_session(id, db):
     
     cookies = await get_animepahe_cookies(db)
     
-    cursor = await db.execute(
-        "SELECT page_count FROM anime_episode WHERE external_id = ?", (id,))
-    row = await cursor.fetchone()
-    
-    if not row or not row["page_count"]:
-        async with httpx.AsyncClient(cookies=cookies, timeout=10) as client:
-            res = await client.get(f"https://animepahe.si/api?m=release&id={id}")
-            data = res.json()
-        
-        if not data or not data.get("last_page"):
-            return None
+async def get_episode_session(id,db):
+    if not id:
+        return None
+    cookies = await get_animepahe_cookies(db)
+    async with httpx.AsyncClient(cookies=cookies) as client:
+        res = await client.get(f"https://animepahe.si/api?m=release&id={id}")
+        data = res.json()
+        if not data:
+            return {
+                "status":404,
+                "message":"Anime episodes not found"
+            }
+        episode_id = data.get("data")[0].get("session")
+        url = f"https://animepahe.si/play/{id}/{episode_id}"
+        res = await client.get(url,cookies=cookies)
+    episode_session = await asyncio.to_thread(_parse_episode_html,res.text)
+    return episode_session
 
-        await db.execute(
-    "INSERT OR IGNORE INTO anime_episode(episode, external_id, page_count) VALUES (?, ?, ?)",
-    (data.get("total"), id, data.get("last_page"))
-)
+def _parse_episode_html(content):
+    soup = BeautifulSoup(content,"html.parser")
+    div = soup.find("div",id="scrollArea")
+    if not div:
+        return {
+            "status":404,
+            "message":"No scroll Area found"
+        }
+    
+    a_tags = div.find_all("a",class_="dropdown-item")
+    episode_session = []
+    for a_tag in a_tags:
+        episode_dict= {
+            "session":a_tag["href"].split("/")[3],
+            "episode":int(a_tag.text.split(" ")[1])
+        }
+        episode_session.append(episode_dict)
+    return episode_session
 
-        await db.commit()
-        page_count = data.get("last_page")
-    else:
-        page_count = row["page_count"]
-    
-    
-    async def fetch_page(client, page, delay):
-        # Stagger requests with delay
-        await asyncio.sleep(delay)
-        
-        url = (
-            f"https://animepahe.si/api"
-            f"?m=release&id={id}&sort=episode_asc&page={page}"
-        )
-        res = await client.get(url, cookies=cookies)
-        return res.json().get("data", [])
-    
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        # Create tasks with staggered delays (0.5s between each)
-        tasks = [
-            fetch_page(client, page, page * 0.5)
-            for page in range(1, page_count + 1)
-        ]
-        
-        # Fetch all pages concurrently
-        results = await asyncio.gather(*tasks)
-    
-    # Flatten the results
-    episode_result = [episode for page_data in results for episode in page_data]
-    
-    return episode_result
-    
-async def get_pahewin_link(external_id, episode_id,db):
+async def get_pahewin_link(external_id, episode_id,db,quality):
     if not episode_id or not external_id:
         return None
     
@@ -234,25 +222,41 @@ async def get_pahewin_link(external_id, episode_id,db):
         html = res.text
     
     # Offload BeautifulSoup parsing to thread pool
-    link = await asyncio.to_thread(_parse_pahewin_html, html, url)
+    link = await asyncio.to_thread(_parse_pahewin_html, html, url,quality)
     return link
 
 
-def _parse_pahewin_html(html, url):
-    """Synchronous HTML parsing - runs in thread pool"""
+def _parse_pahewin_html(html, url, quality="720p"):
     soup = BeautifulSoup(html, "html.parser")
     dropdown = soup.find("div", id="pickDownload")
     if not dropdown:
         return None
     
     links = dropdown.find_all("a", class_="dropdown-item")
+    
+    # Get all available qualities with their links
+    available = []
     for a in links:
         text = a.get_text(" ", strip=True).lower()
-        if "720p" in text and "eng" not in text:
-            return a["href"]
+        if "eng" not in text:  # Skip English dubs
+            # Extract resolution (360, 720, 1080, 400, 800, etc.)
+            match = re.search(r'(\d+)p', text)
+            if match:
+                resolution = int(match.group(1))
+                available.append({
+                    "resolution": resolution,
+                    "link": a["href"],
+                    "text": text
+                })
     
-    print("No link found")
-    return None
+    if not available:
+        return None
+    
+    # Find closest match to requested quality
+    target = int(quality.replace("p", ""))
+    closest = min(available, key=lambda x: abs(x["resolution"] - target))
+    
+    return closest["link"]
 
 async def get_kiwi_url(pahe_url):
     if not pahe_url:
@@ -334,7 +338,7 @@ def _parse_and_deobfuscate_kiwi(html, cookies):
         "kwik_session": cookies.get("kwik_session")
     }
 
-async def get_redirect_link(url, id, episode, db,snapshot):
+async def get_redirect_link(url, id, episode, db,snapshot,quality):
     if not url or not id or not episode:
         print("No url,episode or id detected ending now")
         return None
@@ -376,14 +380,15 @@ async def get_redirect_link(url, id, episode, db,snapshot):
     
     # Async database operations
     await db.execute(
-        "INSERT OR REPLACE INTO cached_video_url(internal_id,episode,video_url,size,snapshot) VALUES(?,?,?,?,?)",
-        (id, episode, direct_link, size,snapshot)
+        "INSERT OR REPLACE INTO cached_video_url(internal_id,episode,video_url,size,snapshot,quality) VALUES(?,?,?,?,?,?)",
+        (id, episode, direct_link, size,snapshot,quality)
     )
     await db.commit()
     return {
         "direct_link": direct_link,
         "episode": episode,
         "snapshot": snapshot,
+        "quality":quality,
         "status": 200,
         "size": size
     }

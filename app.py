@@ -56,6 +56,7 @@ async def lifespan(app: FastAPI):
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 title TEXT NOT NULL,
                 episodes TEXT NOT NULL,
+                poster TEXT,
                 internal_id TEXT NOT NULL UNIQUE,
                 external_id TEXT NOT NULL UNIQUE
             )
@@ -87,6 +88,7 @@ async def lifespan(app: FastAPI):
                 size TEXT,
                 snapshot TEXT,
                 episode TEXT,
+                quality TEXT,
                 UNIQUE(internal_id, episode)
             )
         """)

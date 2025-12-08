@@ -44,14 +44,15 @@ async def anime_search(query: str = Query(..., description="Anime name for the s
             if not row:
                 internal_id = await generate_internal_id(i.get("title"))
                 await db.execute('''
-                INSERT INTO anime_info(internal_id, external_id, title, episodes)
-VALUES (?, ?, ?, ?)
+                INSERT INTO anime_info(internal_id, external_id, title, episodes,poster)
+VALUES (?, ?, ?, ?, ?)
 ON CONFLICT(external_id) DO UPDATE SET
     title = excluded.title,
-    episodes = excluded.episodes;
+    episodes = excluded.episodes,
+    poster = excluded.poster;
 
                 ''',
-                        (internal_id, i.get("session"), i.get("title"), episodes))
+                        (internal_id, i.get("session"), i.get("title"), episodes,i.get("poster")))
                 await db.commit()
             else:
                 internal_id = row["internal_id"]
@@ -88,12 +89,14 @@ ON CONFLICT(external_id) DO UPDATE SET
             "message":"Internal Server error"
         })
 
+
+        
 @router.get("/download", description="Download anime using id gotten from search",summary="Download anime")
-async def anime_download(id:str = Query(...,description="id for the anime from search",example="OP3526"),episode:int = Query(...,description="Anime episode number",example=6),db= Depends(get_db)):
-    if not id or not episode:
+async def anime_download(id:str = Query(...,description="id for the anime from search",example="OP3526"),episode:int = Query(...,description="Anime episode number",example=6),quality: str = Query("720p", regex="^(360p|720p|1080p)$"),db= Depends(get_db)):
+    if not id or not episode or not quality:
         return JSONResponse(status_code=400,content={
             "status":400,
-            "message":"Id and episode are required"
+            "message":"Id, episode or quality are required"
         })
     info = await get_cached_anime_info(id,db)
     if not info.get("status") == 200:
@@ -119,31 +122,39 @@ async def anime_download(id:str = Query(...,description="id for the anime from s
             "message": "Episode count cannot be zero or below"
         })
     cursor = await db.execute(
-        "SELECT * FROM cached_video_url WHERE internal_id = ? and episode = ?", (id, episode))
+        "SELECT * FROM cached_video_url WHERE internal_id = ? and episode = ? and quality = ?", (id, episode,quality))
     row = await cursor.fetchone()
     if row and row["video_url"]:
         link = row["video_url"]
-        async with httpx.AsyncClient(timeout=10) as client:
-            res = await client.head(link)
-        if res.status_code == 200:
-            return {
+        cursor2 = await db.execute("SELECT poster FROM anime_info WHERE internal_id = ?",(id,))
+        row2 = await cursor2.fetchone()
+        return {
                 "status": 200,
                 "direct_link": row["video_url"],
+                "snapshot":row2["poster"],
+                "quality":quality,
                 "size": row["size"],
                 "episode": row["episode"]
             }
+    cursor = await db.execute("SELECT poster FROM anime_info WHERE internal_id = ?",(id,))
+    row = await cursor.fetchone()
+    if not row:
+        return{
+            "status":404,
+            "message":"No image poster available"
+        }
     search_result = await get_episode_session(info["external_id"],db)
     episode_info = search_result[int(episode)-1]
     episode_session = episode_info.get("session")
-    episode_snapshot = episode_info.get("snapshot")
-    pahe_link = await get_pahewin_link(info["external_id"], episode_session)
+    episode_snapshot = row["poster"]
+    pahe_link = await get_pahewin_link(info["external_id"], episode_session,db,quality)
     if pahe_link is None:
         return JSONResponse(status_code=404,content={
             "status": 404,
             "message": "Internal Link not found"
         })
     kiwi_url = await get_kiwi_url(pahe_link)
-    results = await get_redirect_link(kiwi_url, id, episode,db,episode_snapshot)
+    results = await get_redirect_link(kiwi_url, id, episode,db,episode_snapshot,quality)
     if not results:
         return JSONResponse(status_code=500,content={
         "status": 500,
@@ -158,6 +169,7 @@ async def anime_bulk_download(
     id: str = Query(..., description="ID for the anime from search", example="OP3526"),
     ep_from: int = Query(..., alias="from", description="Starting episode number", example=1, ge=1),
     ep_to: int = Query(..., alias="to", description="Ending episode number", example=24, ge=1),
+    quality: str = Query("720p", regex="^(360p|720p|1080p)$"),
     db = Depends(get_db)
 ):
     # Validation
@@ -201,10 +213,9 @@ async def anime_bulk_download(
     
     # Create list of episode numbers to fetch
     episodes = list(range(ep_from, ep_to + 1))
-    semaphore = asyncio.Semaphore(5)
     # Fetch all episodes concurrently with asyncio.gather
     download_links = await asyncio.gather(*[
-        _fetch_single_episode(id, episode, info["external_id"], db,semaphore)
+        _fetch_single_episode(id, episode, info["external_id"], db,quality)
         for episode in episodes
     ])
     
@@ -237,14 +248,14 @@ async def anime_bulk_download(
     })
 
 
-async def _fetch_single_episode(id: str, episode: int, external_id: str, db, semaphore):
+async def _fetch_single_episode(id: str, episode: int, external_id: str, db,quality):
     """Helper function to fetch a single episode link"""
       # Only N requests at once
     try:
         # Check cache first
         cursor = await db.execute(
-            "SELECT * FROM cached_video_url WHERE internal_id = ? and episode = ?", 
-            (id, episode)
+            "SELECT * FROM cached_video_url WHERE internal_id = ? and episode = ? and quality = ?", 
+            (id, episode,quality)
         )
         row = await cursor.fetchone()
         
@@ -252,15 +263,12 @@ async def _fetch_single_episode(id: str, episode: int, external_id: str, db, sem
             link = row["video_url"]
             
             try:
-                async with httpx.AsyncClient(timeout=10) as client:
-                    res = await client.head(link)
-                
-                if res.status_code == 200:
-                    return {
+                return {
                         "episode": row["episode"],
                         "direct_link": row["video_url"],
                         "size": row["size"],
                         "snapshot": row["snapshot"],
+                        "quality":quality,
                         "status": 200
                     }
             except Exception as e:
@@ -274,9 +282,13 @@ async def _fetch_single_episode(id: str, episode: int, external_id: str, db, sem
         search_result = await get_episode_session(external_id, db)
         episode_info = search_result[episode - 1]
         episode_session = episode_info.get("session")
-        episode_snapshot = episode_info.get("snapshot")
+        cursor2 = await db.execute("SELECT poster FROM anime_info WHERE internal_id = ?",(id,))
+        row2 = await cursor2.fetchone()
+        if not row2:
+            return None
+        episode_snapshot = row2["poster"]
         
-        pahe_link = await get_pahewin_link(external_id, episode_session,db)
+        pahe_link = await get_pahewin_link(external_id, episode_session,db,quality)
         if not pahe_link:
             print(f"❌ Episode {episode}: No pahe link found")
             return None
@@ -286,7 +298,7 @@ async def _fetch_single_episode(id: str, episode: int, external_id: str, db, sem
             print(f"❌ Episode {episode}: No kiwi URL found")
             return None
         
-        results = await get_redirect_link(kiwi_url, id, episode, db, episode_snapshot)
+        results = await get_redirect_link(kiwi_url, id, episode, db, episode_snapshot,quality)
         
         if results and results.get("status") == 200:
             return results

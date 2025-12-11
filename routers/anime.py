@@ -4,8 +4,8 @@ import traceback
 import io
 import zipfile
 import asyncio
-from fastapi import APIRouter, Query, Depends,Request
-from fastapi.responses import JSONResponse,StreamingResponse,Response
+from fastapi import APIRouter, Query, Depends,Request,WebSocket,WebSocketDisconnect
+from fastapi.responses import JSONResponse,StreamingResponse,Response,FileResponse
 import httpx
 from db import get_db
 from helpers.anime_helper import get_pahewin_link,get_episode_session,get_kiwi_url,get_redirect_link
@@ -317,136 +317,79 @@ import json
 import asyncio
 import tempfile
 import shutil
+import time
 from pathlib import Path
 from zipfile import ZipFile, ZIP_DEFLATED
 import httpx
-from fastapi import Query, Depends
-from fastapi.responses import StreamingResponse, JSONResponse
 
-@router.get("/bulk-download-zip")
-async def bulk_download_zip_get(
-    session_id: str = Query(..., description="Download session ID"),
+# ============================================
+# NEW ROUTE 1: WebSocket endpoint for progress
+# ============================================
+@router.websocket("/ws/bulk-download/{session_id}")
+async def websocket_bulk_download(
+    websocket: WebSocket,
+    session_id: str,
     db = Depends(get_db)
 ):
     """
-    Stream ZIP using temporary files with retry logic
+    WebSocket endpoint that streams download progress to the client
     """
+    await websocket.accept()
     
-    # Get session
-    cursor = await db.execute(
-        "SELECT * FROM download_sessions WHERE session_id = ?",
-        (session_id,)
-    )
-    row = await cursor.fetchone()
-    
-    if not row:
-        return JSONResponse(status_code=404, content={"status": 404, "message": "Session not found"})
-    
-    links = json.loads(row["links"])
-    anime_title = row["anime_title"].replace(" ", "_").lower()
-    
-    # Get episode range
-    episodes = [int(link_info.get("episode")) for link_info in links if link_info.get("episode")]
-    from_ep = min(episodes) if episodes else 1
-    to_ep = max(episodes) if episodes else 1
-    
-    zip_filename = f"{anime_title}_{from_ep}-{to_ep}_episodes.zip"
-    
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Referer': 'https://kwik.cx/',
-    }
-    
-    async def download_with_retry(client, url, temp_file, episode, max_retries=3):
-        """Download file with retry and resume support"""
+    try:
+        # Get session
+        cursor = await db.execute(
+            "SELECT * FROM download_sessions WHERE session_id = ?",
+            (session_id,)
+        )
+        row = await cursor.fetchone()
         
-        for attempt in range(max_retries):
-            try:
-                # Check if file exists (for resume)
-                start_byte = 0
-                if os.path.exists(temp_file):
-                    start_byte = os.path.getsize(temp_file)
-                    print(f"🔄 Resuming from {start_byte / 1024 / 1024:.2f} MB")
-                
-                # Add range header for resume
-                download_headers = headers.copy()
-                if start_byte > 0:
-                    download_headers['Range'] = f'bytes={start_byte}-'
-                
-                # Download
-                async with client.stream('GET', url, headers=download_headers, timeout=120.0) as response:
-                    # Check if resume is supported
-                    if start_byte > 0 and response.status_code not in [206, 200]:
-                        print(f"⚠️ Resume not supported, starting fresh")
-                        start_byte = 0
-                        os.remove(temp_file) if os.path.exists(temp_file) else None
-                        return await download_with_retry(client, url, temp_file, episode, max_retries - attempt)
-                    
-                    response.raise_for_status()
-                    
-                    # Get total size
-                    content_length = response.headers.get('content-length')
-                    total_size = int(content_length) if content_length else None
-                    
-                    # Open file in append mode if resuming
-                    mode = 'ab' if start_byte > 0 else 'wb'
-                    with open(temp_file, mode) as f:
-                        downloaded = start_byte
-                        last_print = 0
-                        
-                        async for chunk in response.aiter_bytes(chunk_size=1024*1024):
-                            f.write(chunk)
-                            downloaded += len(chunk)
-                            
-                            # Print progress every 50MB
-                            if downloaded - last_print >= 50 * 1024 * 1024:
-                                if total_size:
-                                    progress = (downloaded / total_size) * 100
-                                    print(f"📥 Episode {episode}: {downloaded / 1024 / 1024:.1f} MB / {total_size / 1024 / 1024:.1f} MB ({progress:.1f}%)")
-                                else:
-                                    print(f"📥 Episode {episode}: {downloaded / 1024 / 1024:.1f} MB")
-                                last_print = downloaded
-                    
-                    print(f"✅ Downloaded Episode {episode} ({downloaded / 1024 / 1024:.2f} MB)")
-                    return True
-                    
-            except (httpx.RemoteProtocolError, httpx.ReadTimeout, httpx.ConnectError) as e:
-                print(f"⚠️ Episode {episode} attempt {attempt + 1}/{max_retries} failed: {e}")
-                
-                if attempt < max_retries - 1:
-                    wait_time = (attempt + 1) * 2  # 2s, 4s, 6s
-                    print(f"⏳ Retrying in {wait_time}s...")
-                    await asyncio.sleep(wait_time)
-                else:
-                    print(f"❌ Episode {episode} failed after {max_retries} attempts")
-                    return False
-                    
-            except Exception as e:
-                print(f"❌ Episode {episode} unexpected error: {e}")
-                return False
+        if not row:
+            await websocket.send_json({
+                "status": "error",
+                "message": "Session not found"
+            })
+            await websocket.close()
+            return
         
-        return False
-    
-    async def stream_zip():
-        """Stream ZIP file with temp storage and retry logic"""
+        links = json.loads(row["links"])
+        anime_title = row["anime_title"].replace(" ", "_").lower()
+        
+        # Get episode range
+        episodes = [int(link_info.get("episode")) for link_info in links if link_info.get("episode")]
+        from_ep = min(episodes) if episodes else 1
+        to_ep = max(episodes) if episodes else 1
+        
+        zip_filename = f"{anime_title}_{from_ep}-{to_ep}_episodes.zip"
+        
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Referer': 'https://kwik.cx/',
+        }
+        
+        # Send initial status
+        await websocket.send_json({
+            "status": "started",
+            "message": f"Preparing to download {len(links)} episodes...",
+            "total_episodes": len(links)
+        })
+        
         temp_dir = None
         zip_path = None
         
         try:
             # Create temp directory
             temp_dir = tempfile.mkdtemp()
-            zip_path = os.path.join(temp_dir, "output.zip")
+            zip_path = os.path.join(temp_dir, zip_filename)
             
-            print(f"📁 Temp dir: {temp_dir}")
-            
-            # Track successful downloads
             successful_episodes = []
             
-            # Download all episodes first
+            # Download episodes with progress updates
             async with httpx.AsyncClient(
                 timeout=httpx.Timeout(120.0, connect=30.0),
                 limits=httpx.Limits(max_keepalive_connections=5, max_connections=10)
             ) as client:
+                
                 for idx, link_info in enumerate(links, 1):
                     episode = link_info.get("episode")
                     url = link_info.get("direct_link")
@@ -456,9 +399,20 @@ async def bulk_download_zip_get(
                     
                     temp_file = os.path.join(temp_dir, f"ep_{episode}.mp4")
                     
-                    print(f"\n🎬 [{idx}/{len(links)}] Starting Episode {episode}...")
+                    # Send episode start status
+                    await websocket.send_json({
+                        "status": "downloading",
+                        "episode": episode,
+                        "current": idx,
+                        "total": len(links),
+                        "message": f"Downloading Episode {episode}...",
+                        "progress": 0
+                    })
                     
-                    success = await download_with_retry(client, url, temp_file, episode)
+                    # Download with retry
+                    success = await download_with_retry_ws(
+                        client, url, temp_file, episode, websocket, idx, len(links)
+                    )
                     
                     if success:
                         successful_episodes.append({
@@ -466,59 +420,221 @@ async def bulk_download_zip_get(
                             'temp_file': temp_file,
                             'filename': f"{anime_title}_Episode_{str(episode).zfill(3)}.mp4"
                         })
+                        
+                        # Send episode complete status
+                        await websocket.send_json({
+                            "status": "episode_complete",
+                            "episode": episode,
+                            "current": idx,
+                            "total": len(links),
+                            "message": f"✅ Episode {episode} downloaded!",
+                            "successful_count": len(successful_episodes)
+                        })
                     else:
-                        # Clean up failed download
+                        # Send episode failed status
+                        await websocket.send_json({
+                            "status": "episode_failed",
+                            "episode": episode,
+                            "message": f"❌ Episode {episode} failed after retries"
+                        })
+                        
                         if os.path.exists(temp_file):
                             os.remove(temp_file)
             
             if not successful_episodes:
-                raise Exception("No episodes downloaded successfully!")
+                await websocket.send_json({
+                    "status": "error",
+                    "message": "No episodes downloaded successfully!"
+                })
+                await websocket.close()
+                return
             
-            print(f"\n📦 Creating ZIP with {len(successful_episodes)} episodes...")
+            # Send zipping status
+            await websocket.send_json({
+                "status": "zipping",
+                "message": f"Creating ZIP file with {len(successful_episodes)} episodes...",
+                "successful_count": len(successful_episodes),
+                "total": len(links)
+            })
             
-            # Create ZIP file
+            # Create ZIP
             with ZipFile(zip_path, 'w', ZIP_DEFLATED) as zipf:
-                for ep_info in successful_episodes:
+                for ep_idx, ep_info in enumerate(successful_episodes, 1):
                     zipf.write(ep_info['temp_file'], ep_info['filename'])
-                    print(f"📦 Added: {ep_info['filename']}")
-                    # Delete temp file after adding to ZIP
+                    
+                    # Send zipping progress
+                    await websocket.send_json({
+                        "status": "zipping",
+                        "message": f"Adding Episode {ep_info['episode']} to ZIP...",
+                        "zip_progress": int((ep_idx / len(successful_episodes)) * 100)
+                    })
+                    
                     os.remove(ep_info['temp_file'])
             
-            zip_size = os.path.getsize(zip_path) / 1024 / 1024
-            print(f"✨ ZIP created! Size: {zip_size:.2f} MB")
-            print(f"✨ Successfully packed {len(successful_episodes)}/{len(links)} episodes")
+            zip_size = os.path.getsize(zip_path)
             
-            # Stream the ZIP file
-            with open(zip_path, 'rb') as f:
-                chunk_size = 1024 * 1024  # 1MB chunks
-                while True:
-                    chunk = f.read(chunk_size)
-                    if not chunk:
-                        break
-                    yield chunk
-                    
+            # Send completion status with download link
+            await websocket.send_json({
+                "status": "complete",
+                "message": "ZIP file ready for download!",
+                "download_url": f"/anime/download-zip/{session_id}",
+                "filename": zip_filename,
+                "size": zip_size,
+                "size_mb": round(zip_size / 1024 / 1024, 2),
+                "successful_count": len(successful_episodes),
+                "total": len(links)
+            })
+            
         except Exception as e:
-            print(f"💥 Fatal error: {e}")
+            await websocket.send_json({
+                "status": "error",
+                "message": f"Error: {str(e)}"
+            })
             raise
             
-        finally:
-            # Cleanup temp files
-            if temp_dir and os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir)
-                print(f"🧹 Cleaned up temp dir")
+    except WebSocketDisconnect:
+        print("WebSocket disconnected")
+    except Exception as e:
+        print(f"WebSocket error: {e}")
+        try:
+            await websocket.send_json({
+                "status": "error",
+                "message": str(e)
+            })
+        except:
+            pass
+    finally:
+        # Don't cleanup temp files here - they're needed for download
+        pass
+
+
+async def download_with_retry_ws(client, url, temp_file, episode, websocket, current, total, max_retries=3):
+    """Download with retry and WebSocket progress updates"""
     
-    # Delete session
+    for attempt in range(max_retries):
+        try:
+            start_byte = 0
+            if os.path.exists(temp_file):
+                start_byte = os.path.getsize(temp_file)
+            
+            download_headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Referer': 'https://kwik.cx/',
+            }
+            
+            if start_byte > 0:
+                download_headers['Range'] = f'bytes={start_byte}-'
+            
+            start_time = time.time()
+            
+            async with client.stream('GET', url, headers=download_headers, timeout=120.0) as response:
+                if start_byte > 0 and response.status_code not in [206, 200]:
+                    start_byte = 0
+                    if os.path.exists(temp_file):
+                        os.remove(temp_file)
+                
+                response.raise_for_status()
+                
+                content_length = response.headers.get('content-length')
+                total_size = int(content_length) if content_length else None
+                
+                mode = 'ab' if start_byte > 0 else 'wb'
+                with open(temp_file, mode) as f:
+                    downloaded = start_byte
+                    last_update = time.time()
+                    
+                    async for chunk in response.aiter_bytes(chunk_size=1024*1024):
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        
+                        # Send progress update every 0.5 seconds
+                        if time.time() - last_update >= 0.5:
+                            progress = 0
+                            if total_size:
+                                progress = int((downloaded / total_size) * 100)
+                            
+                            elapsed = time.time() - start_time
+                            speed = downloaded / elapsed if elapsed > 0 else 0
+                            
+                            await websocket.send_json({
+                                "status": "downloading",
+                                "episode": episode,
+                                "current": current,
+                                "total": total,
+                                "progress": progress,
+                                "downloaded_mb": round(downloaded / 1024 / 1024, 2),
+                                "total_mb": round(total_size / 1024 / 1024, 2) if total_size else None,
+                                "speed_mbps": round(speed / 1024 / 1024, 2),
+                                "message": f"Downloading Episode {episode}... {progress}%"
+                            })
+                            last_update = time.time()
+                
+                return True
+                
+        except (httpx.RemoteProtocolError, httpx.ReadTimeout, httpx.ConnectError) as e:
+            if attempt < max_retries - 1:
+                wait_time = (attempt + 1) * 2
+                await websocket.send_json({
+                    "status": "retrying",
+                    "episode": episode,
+                    "attempt": attempt + 1,
+                    "max_retries": max_retries,
+                    "message": f"Retry {attempt + 1}/{max_retries} in {wait_time}s..."
+                })
+                await asyncio.sleep(wait_time)
+            else:
+                return False
+        except Exception as e:
+            return False
+    
+    return False
+
+
+# ============================================
+# NEW ROUTE 2: Simple download endpoint
+# ============================================
+@router.get("/download-zip/{session_id}")
+async def download_completed_zip(
+    session_id: str,
+    db = Depends(get_db)
+):
+    """
+    Simple endpoint to download the already-prepared ZIP file
+    This is called AFTER the WebSocket completes
+    """
+    cursor = await db.execute(
+        "SELECT * FROM download_sessions WHERE session_id = ?",
+        (session_id,)
+    )
+    row = await cursor.fetchone()
+    
+    if not row:
+        return JSONResponse(status_code=404, content={"status": 404, "message": "Session not found"})
+    
+    anime_title = row["anime_title"].replace(" ", "_").lower()
+    links = json.loads(row["links"])
+    episodes = [int(link_info.get("episode")) for link_info in links if link_info.get("episode")]
+    from_ep = min(episodes) if episodes else 1
+    to_ep = max(episodes) if episodes else 1
+    zip_filename = f"{anime_title}_{from_ep}-{to_ep}_episodes.zip"
+    
+    # Find the ZIP file in temp directory
+    # In production, you'd store the temp path in the database or cache
+    temp_dir = tempfile.gettempdir()
+    zip_path = os.path.join(temp_dir, zip_filename)
+    
+    if not os.path.exists(zip_path):
+        return JSONResponse(status_code=404, content={"status": 404, "message": "ZIP file not ready yet"})
+    
+    # Delete session after providing download
     await db.execute("DELETE FROM download_sessions WHERE session_id = ?", (session_id,))
     await db.commit()
     
-    # Stream the ZIP
-    return StreamingResponse(
-        stream_zip(),
+    return FileResponse(
+        zip_path,
         media_type="application/zip",
-        headers={
-            "Content-Disposition": f'attachment; filename="{zip_filename}"',
-            "Content-Type": "application/zip"
-        }
+        filename=zip_filename,
+        background=None  # File cleanup handled separately
     )
 
 @router.get("/proxy-image", description="Proxy images from animepahe")

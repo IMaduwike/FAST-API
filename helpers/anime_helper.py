@@ -271,7 +271,7 @@ async def get_kiwi_url(pahe_url):
 
     # Async HTTP request with httpx
     async with httpx.AsyncClient() as client:
-        res = await client.get(pahe_url, timeout=10, headers=headers)
+        res = await client.get(pahe_url, timeout=30, headers=headers)
         html = res.text
     
     # Offload BeautifulSoup parsing to thread pool

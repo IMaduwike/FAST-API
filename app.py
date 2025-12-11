@@ -79,7 +79,15 @@ async def lifespan(app: FastAPI):
                 external_id TEXT NOT NULL UNIQUE
             )
         """)
-
+        await db.execute(
+""" 
+            CREATE TABLE IF NOT EXISTS zip_cache (
+    session_id TEXT PRIMARY KEY,
+    zip_path TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    expires_at TIMESTAMP NOT NULL
+);"""
+        )
         await db.execute("""
             CREATE TABLE IF NOT EXISTS cached_video_url (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,

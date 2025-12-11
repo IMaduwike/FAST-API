@@ -318,12 +318,15 @@ import asyncio
 import tempfile
 import shutil
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 from zipfile import ZipFile, ZIP_DEFLATED
 import httpx
+from fastapi import WebSocket, WebSocketDisconnect, Query, Depends
+from fastapi.responses import FileResponse, JSONResponse
 
 # ============================================
-# NEW ROUTE 1: WebSocket endpoint for progress
+# WebSocket endpoint for progress
 # ============================================
 @router.websocket("/ws/bulk-download/{session_id}")
 async def websocket_bulk_download(
@@ -381,6 +384,9 @@ async def websocket_bulk_download(
             # Create temp directory
             temp_dir = tempfile.mkdtemp()
             zip_path = os.path.join(temp_dir, zip_filename)
+            
+            print(f"📁 Created temp dir: {temp_dir}")
+            print(f"📦 ZIP will be saved at: {zip_path}")
             
             successful_episodes = []
             
@@ -472,6 +478,17 @@ async def websocket_bulk_download(
                     os.remove(ep_info['temp_file'])
             
             zip_size = os.path.getsize(zip_path)
+            print(f"✅ ZIP created successfully: {zip_size / 1024 / 1024:.2f} MB")
+            
+            # Store ZIP path in database (expires in 1 hour)
+            expires_at = datetime.now() + timedelta(hours=1)
+            await db.execute(
+                """INSERT OR REPLACE INTO zip_cache (session_id, zip_path, expires_at) 
+                   VALUES (?, ?, ?)""",
+                (session_id, zip_path, expires_at)
+            )
+            await db.commit()
+            print(f"💾 Saved ZIP path to database for session: {session_id}")
             
             # Send completion status with download link
             await websocket.send_json({
@@ -486,6 +503,7 @@ async def websocket_bulk_download(
             })
             
         except Exception as e:
+            print(f"❌ Error during download: {e}")
             await websocket.send_json({
                 "status": "error",
                 "message": f"Error: {str(e)}"
@@ -503,9 +521,6 @@ async def websocket_bulk_download(
             })
         except:
             pass
-    finally:
-        # Don't cleanup temp files here - they're needed for download
-        pass
 
 
 async def download_with_retry_ws(client, url, temp_file, episode, websocket, current, total, max_retries=3):
@@ -591,7 +606,7 @@ async def download_with_retry_ws(client, url, temp_file, episode, websocket, cur
 
 
 # ============================================
-# NEW ROUTE 2: Simple download endpoint
+# Download endpoint - retrieves from database
 # ============================================
 @router.get("/download-zip/{session_id}")
 async def download_completed_zip(
@@ -602,40 +617,97 @@ async def download_completed_zip(
     Simple endpoint to download the already-prepared ZIP file
     This is called AFTER the WebSocket completes
     """
+    # Get ZIP path from cache
     cursor = await db.execute(
-        "SELECT * FROM download_sessions WHERE session_id = ?",
+        "SELECT zip_path, expires_at FROM zip_cache WHERE session_id = ?",
         (session_id,)
     )
     row = await cursor.fetchone()
     
     if not row:
-        return JSONResponse(status_code=404, content={"status": 404, "message": "Session not found"})
+        return JSONResponse(
+            status_code=404, 
+            content={"status": 404, "message": "ZIP file not found or expired"}
+        )
     
-    anime_title = row["anime_title"].replace(" ", "_").lower()
-    links = json.loads(row["links"])
-    episodes = [int(link_info.get("episode")) for link_info in links if link_info.get("episode")]
-    from_ep = min(episodes) if episodes else 1
-    to_ep = max(episodes) if episodes else 1
-    zip_filename = f"{anime_title}_{from_ep}-{to_ep}_episodes.zip"
+    zip_path = row["zip_path"]
+    expires_at = datetime.fromisoformat(row["expires_at"])
     
-    # Find the ZIP file in temp directory
-    # In production, you'd store the temp path in the database or cache
-    temp_dir = tempfile.gettempdir()
-    zip_path = os.path.join(temp_dir, zip_filename)
+    # Check if expired
+    if datetime.now() > expires_at:
+        # Clean up expired file
+        if os.path.exists(zip_path):
+            os.remove(zip_path)
+        await db.execute("DELETE FROM zip_cache WHERE session_id = ?", (session_id,))
+        await db.commit()
+        return JSONResponse(
+            status_code=410, 
+            content={"status": 410, "message": "ZIP file expired"}
+        )
     
+    # Check if file exists
     if not os.path.exists(zip_path):
-        return JSONResponse(status_code=404, content={"status": 404, "message": "ZIP file not ready yet"})
+        await db.execute("DELETE FROM zip_cache WHERE session_id = ?", (session_id,))
+        await db.commit()
+        return JSONResponse(
+            status_code=404, 
+            content={"status": 404, "message": "ZIP file not found"}
+        )
     
-    # Delete session after providing download
-    await db.execute("DELETE FROM download_sessions WHERE session_id = ?", (session_id,))
-    await db.commit()
+    # Get filename from path
+    filename = os.path.basename(zip_path)
+    
+    print(f"📥 Serving ZIP: {filename} ({os.path.getsize(zip_path) / 1024 / 1024:.2f} MB)")
+    
+    # Don't delete immediately - let user download
+    # Schedule cleanup for later (you can add a cleanup cron job)
     
     return FileResponse(
         zip_path,
         media_type="application/zip",
-        filename=zip_filename,
-        background=None  # File cleanup handled separately
+        filename=filename,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"'
+        }
     )
+
+
+# ============================================
+# Optional: Cleanup endpoint (run as cron job)
+# ============================================
+@router.post("/cleanup-expired-zips")
+async def cleanup_expired_zips(db = Depends(get_db)):
+    """
+    Cleanup expired ZIP files (run this as a scheduled task)
+    """
+    cursor = await db.execute(
+        "SELECT session_id, zip_path FROM zip_cache WHERE expires_at < ?",
+        (datetime.now(),)
+    )
+    rows = await cursor.fetchall()
+    
+    cleaned = 0
+    for row in rows:
+        zip_path = row["zip_path"]
+        session_id = row["session_id"]
+        
+        # Delete file
+        if os.path.exists(zip_path):
+            try:
+                # Also delete the temp directory
+                temp_dir = os.path.dirname(zip_path)
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                cleaned += 1
+                print(f"🧹 Cleaned up: {zip_path}")
+            except Exception as e:
+                print(f"Failed to cleanup {zip_path}: {e}")
+        
+        # Delete from database
+        await db.execute("DELETE FROM zip_cache WHERE session_id = ?", (session_id,))
+    
+    await db.commit()
+    
+    return {"status": 200, "message": f"Cleaned up {cleaned} expired files"}
 
 @router.get("/proxy-image", description="Proxy images from animepahe")
 async def proxy_image(

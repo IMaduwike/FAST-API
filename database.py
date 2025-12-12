@@ -2,39 +2,40 @@ import asyncpg
 from typing import AsyncGenerator
 import os
 from contextlib import asynccontextmanager
+import ssl
 
-# PostgreSQL connection details (use environment variables for security)
-DATABASE_URL = os.getenv(
-    "DATABASE_URL")
+# Load DATABASE_URL from environment
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Global connection pool
-pool: asyncpg.Pool = None
+# Global pool reference
+pool: asyncpg.Pool | None = None
+
+# Supabase requires SSL
+ssl_context = ssl.create_default_context()
 
 
 async def init_db():
     """
-    Initialize database connection pool and create tables
-    Run this on startup!
+    Initialize database connection pool and create required tables.
+    Called on FastAPI startup.
     """
     global pool
-    
+
     print("🔌 Connecting to PostgreSQL...")
-    
-    # Create connection pool
+
     pool = await asyncpg.create_pool(
-        DATABASE_URL,
+        dsn=DATABASE_URL,
+        ssl=ssl_context,     # REQUIRED for Supabase
         min_size=5,
         max_size=20,
         command_timeout=60
     )
-    
+
     print("✅ PostgreSQL connected!")
-    
-    # Create tables
+
     async with pool.acquire() as conn:
         print("📋 Creating tables...")
-        
-        # Download sessions table
+
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS download_sessions (
                 id SERIAL PRIMARY KEY,
@@ -44,8 +45,7 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        
-        # Analytics table
+
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS analytics (
                 id SERIAL PRIMARY KEY,
@@ -61,32 +61,28 @@ async def init_db():
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        
-        # Create indexes for better performance
+
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_event_type ON analytics(event_type)
         """)
-        
+
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_anime_title ON analytics(anime_title)
         """)
-        
+
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_timestamp ON analytics(timestamp)
         """)
-        
+
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_session_id ON download_sessions(session_id)
         """)
-        
+
         print("✅ Tables created successfully!")
 
 
 async def close_db():
-    """
-    Close database connection pool
-    Run this on shutdown!
-    """
+    """Close the database pool on shutdown."""
     global pool
     if pool:
         await pool.close()
@@ -94,9 +90,6 @@ async def close_db():
 
 
 async def get_db() -> AsyncGenerator[asyncpg.Connection, None]:
-    """
-    Dependency for getting database connection
-    Use this in your FastAPI endpoints
-    """
+    """FastAPI dependency for getting a connection from the pool."""
     async with pool.acquire() as conn:
         yield conn

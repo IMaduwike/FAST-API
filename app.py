@@ -35,7 +35,7 @@ async def lifespan(app: FastAPI):
     print("🔌 Starting services...")
     
     # 1. Initialize PostgreSQL (for analytics)
-    await init_db()
+    await get_db()
     print("✅ PostgreSQL ready!")
     
     # 2. Initialize SQLite (for caching)

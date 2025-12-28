@@ -12,7 +12,6 @@ from contextlib import asynccontextmanager
 from routers.tiktok import router as tiktok_router
 from routers.file import file_router
 from db import get_db
-from database import init_db, close_db  # PostgreSQL functions
 from routers.analytics import router as analytics_router
 from routers.anime import router as anime_router
 from helpers.anime_helper import get_animepahe_cookies
@@ -34,13 +33,10 @@ async def lifespan(app: FastAPI):
     # STARTUP
     print("🔌 Starting services...")
     
-    # 1. Initialize PostgreSQL (for analytics)
-    await get_db()
-    print("✅ PostgreSQL ready!")
     
     # 2. Initialize SQLite (for caching)
     async with aiosqlite.connect("cache.db") as db:
-        print("📦 Setting up SQLite cache...")
+        print("📦 Setting up SQLite database...")
         
         await db.execute("""
             CREATE TABLE IF NOT EXISTS videos (

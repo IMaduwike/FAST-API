@@ -15,7 +15,9 @@ from db import get_db
 from routers.analytics import router as analytics_router
 from routers.anime import router as anime_router
 from helpers.anime_helper import get_animepahe_cookies
+import asyncio
 
+db_lock = asyncio.Lock()
 load_dotenv()
 
 limiter = Limiter(
@@ -116,8 +118,6 @@ async def lifespan(app: FastAPI):
     
     # SHUTDOWN
     print("🛑 Shutting down services...")
-    await close_db()
-    print("👋 Application stopped!")
 
 
 # ---------------- CREATE APP WITH LIFESPAN ----------------
